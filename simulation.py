@@ -19,12 +19,35 @@ import os
 import random
 import math
 import sys
+import csv
 from collections import deque
 from heapq import heappop, heappush
 
 ST_READY, ST_LOADING, ST_FLYING = 0, 1, 2
 ST_NAME = {ST_READY: "ГОТОВ", ST_LOADING: "ЗАГРУЗКА", ST_FLYING: "РЕЙС"}
 NORMAL, HIGH = "normal", "high"
+
+
+class Tee:
+    """Дублирование вывода в консоль и в файл (файл всегда в UTF-8)."""
+
+    def __init__(self, *streams):
+        self.streams = list(streams)
+
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+            except UnicodeEncodeError:
+                enc = getattr(st, "encoding", None) or "utf-8"
+                st.write(s.encode(enc, "replace").decode(enc, "replace"))
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
 
 
 class Plane:
@@ -330,15 +353,49 @@ def load_config(path="config.json"):
 
 def main():
     cfg = load_config()
-    if "--trace" in sys.argv:
-        sim = Simulation(cfg, seed=cfg.get("seed_trace", 7), trace=True, record=True)
-        sim.run()
-        print("\n=== ИТОГОВЫЙ БАЛАНС ПРОГОНА (трассировка) ===")
-        lhs, rhs, err = sim.consistency_balance()
-        print(f"прибыло тонн: {lhs:.1f} | вывезено+остаток: {rhs:.1f} | расхождение: {err:.6f}")
-        for k, v in sim.responses.items():
-            print(f"{k:26s} = {v:.4f}" if isinstance(v, float) else f"{k:26s} = {v}")
+    os.makedirs("out", exist_ok=True)
+
+    if "--trace-excerpt" in sys.argv:
+        import io
+        cfg2 = dict(cfg)
+        cfg2["horizon"] = 300.0
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            sim = Simulation(cfg2, seed=cfg.get("seed_trace", 7), trace=True)
+            sim.run()
+        finally:
+            sys.stdout = old
+        lines = buf.getvalue().splitlines()
+        path = os.path.join("out", "trace_excerpt.txt")
+        with open(path, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("\n".join(lines[:80]) + "\n")
+        print(f"Фрагмент трассы ({min(80, len(lines))} строк из "
+              f"{len(lines)}) -> {path}")
         return sim
+
+    if "--trace" in sys.argv:
+        path = os.path.join("out", "trace_full.txt")
+        with open(path, "w", encoding="utf-8-sig", newline="\n") as fh:
+            old = sys.stdout
+            sys.stdout = Tee(sys.stdout, fh)
+            try:
+                sim = Simulation(cfg, seed=cfg.get("seed_trace", 7),
+                                 trace=True, record=True)
+                sim.run()
+                print("\n=== ИТОГОВЫЙ БАЛАНС ПРОГОНА (трассировка) ===")
+                lhs, rhs, err = sim.consistency_balance()
+                print(f"прибыло тонн: {lhs:.1f} | "
+                      f"вывезено+остаток: {rhs:.1f} | расхождение: {err:.6f}")
+                for k, v in sim.responses.items():
+                    print(f"{k:26s} = {v:.4f}" if isinstance(v, float)
+                          else f"{k:26s} = {v}")
+            finally:
+                sys.stdout = old
+        print(f"\nПолная трассировка сохранена: {path} (UTF-8)")
+        return sim
+
     n = cfg.get("n_runs", 1)
     rows = []
     for run in range(1, n + 1):
@@ -353,11 +410,8 @@ def main():
         "R7_stored_tons_end", "R8_in_planes_tons", "arrived_tons",
         "n_departures_high", "n_containers_loaded",
     ]
-    import os
-    os.makedirs("out", exist_ok=True)
-    import csv
     with open(os.path.join("out", "results_replications.csv"), "w",
-              newline="", encoding="utf-8") as f:
+              newline="", encoding="utf-8-sig") as f:
         wr = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         wr.writeheader()
         for r in rows:

@@ -9,6 +9,7 @@ import csv
 import math
 import os
 import statistics
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -205,12 +206,25 @@ def plot_gantt(fname, plane_series, n_normal, n_high, title, tmax):
 
 def read_results():
     path = os.path.join(OUT, "results_replications.csv")
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
+    log_path = os.path.join(OUT, "charts_log.txt")
+    from simulation import Tee
+    with open(log_path, "w", encoding="utf-8-sig", newline="\n") as fh:
+        old = sys.stdout
+        sys.stdout = Tee(sys.stdout, fh)
+        try:
+            _run()
+        finally:
+            sys.stdout = old
+    print(f"Лог сохранён: {log_path} (UTF-8)")
+
+
+def _run():
     cfg = load_config()
     from simulation import main as sim_main
     sim_main()

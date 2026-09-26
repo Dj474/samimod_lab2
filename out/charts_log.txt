@@ -3,7 +3,6 @@ R1_n_departures          mean = 3293.0300
 R2_share_high            mean = 0.2440
 R3_avg_store_count       mean = 22.5759
 R4_avg_wait              mean = 7.4014
-R5_avg_loading_ops       mean = 0.4496
 Рисунки:
   out\fig1_hist_R1.png
   out\fig2_hist_R2.png

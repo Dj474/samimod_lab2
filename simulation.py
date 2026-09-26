@@ -94,7 +94,6 @@ class Simulation:
         self.n_departures = 0
         self.n_departures_high = 0
         self.wait_times = []
-        self.busy_time = 0.0
         self.pending_loads = 0
 
         self.area_count = 0.0
@@ -195,7 +194,6 @@ class Simulation:
             if p.state == ST_LOADING and not p.scheduled:
                 if p.loaded < p.capacity and self.store and self.pending_loads < len(self.store):
                     dt = self._exp(1.0 / cfg["load_time_mean"])
-                    self.busy_time += dt
                     self.pending_loads += 1
                     p.scheduled = True
                     self._schedule(dt, "LOAD_STEP", p)
@@ -305,11 +303,10 @@ class Simulation:
             "R3_avg_store_count": self.area_count / max(self.t, 1e-12),
             "R4_avg_wait": (sum(self.wait_times) / len(self.wait_times)
                             if self.wait_times else 0.0),
-            "R5_avg_loading_ops": self.busy_time / max(self.t, 1e-12),
-            "R6_delivered_tons": self.loaded_weight,
-            "R7_stored_tons_end": self.store_weight,
-            "R8_in_planes_tons": self.in_planes_tons,
             "arrived_tons": self.arrived_weight,
+            "delivered_tons": self.loaded_weight,
+            "stored_tons_end": self.store_weight,
+            "in_planes_tons": self.in_planes_tons,
             "n_departures_high": self.n_departures_high,
             "n_containers_loaded": len(self.wait_times),
         }
@@ -317,10 +314,14 @@ class Simulation:
             self.history = [tuple(h) for h in self.history]
 
     def consistency_balance(self):
+        """Внутренняя проверка: прибыло = вывезено + остаток склада.
+
+        Расхождение равно грузу в самолётах, находящихся в процессе
+        загрузки на момент останова (учитывается отдельно).
+        """
         r = self.responses
         lhs = r["arrived_tons"]
-        rhs = (r["R6_delivered_tons"] + r["R7_stored_tons_end"]
-               + r.get("R8_in_planes_tons", 0.0))
+        rhs = r["delivered_tons"] + r["stored_tons_end"]
         return lhs, rhs, abs(lhs - rhs)
 
 
@@ -386,8 +387,10 @@ def main():
                 sim.run()
                 print("\n=== ИТОГОВЫЙ БАЛАНС ПРОГОНА (трассировка) ===")
                 lhs, rhs, err = sim.consistency_balance()
-                print(f"прибыло тонн: {lhs:.1f} | "
-                      f"вывезено+остаток: {rhs:.1f} | расхождение: {err:.6f}")
+                print(f"прибыло = вывезено + остаток склада: {lhs:.1f} = "
+                      f"{rhs:.1f} | расхождение: {err:.6f} т"
+                      f" (груз в самолётах: "
+                      f"{sim.responses['in_planes_tons']:.1f} т)")
                 for k, v in sim.responses.items():
                     print(f"{k:26s} = {v:.4f}" if isinstance(v, float)
                           else f"{k:26s} = {v}")
@@ -406,9 +409,8 @@ def main():
         rows.append(r)
     keys = [
         "seed", "R1_n_departures", "R2_share_high", "R3_avg_store_count",
-        "R4_avg_wait", "R5_avg_loading_ops", "R6_delivered_tons",
-        "R7_stored_tons_end", "R8_in_planes_tons", "arrived_tons",
-        "n_departures_high", "n_containers_loaded",
+        "R4_avg_wait", "arrived_tons", "delivered_tons", "stored_tons_end",
+        "in_planes_tons", "n_departures_high", "n_containers_loaded",
     ]
     with open(os.path.join("out", "results_replications.csv"), "w",
               newline="", encoding="utf-8-sig") as f:
@@ -420,7 +422,7 @@ def main():
     # краткая сводка
     means = {k: sum(r[k] for r in rows) / n for k in
              ["R1_n_departures", "R2_share_high", "R3_avg_store_count",
-              "R4_avg_wait", "R5_avg_loading_ops"]}
+              "R4_avg_wait"]}
     for k, v in means.items():
         print(f"{k:24s} mean = {v:.4f}")
     return rows

@@ -89008,15 +89008,14 @@ t= 8759.679 | CONTAINER_FLOW   | поступил контейнер весом 
 t= 8759.930 | CONTAINER_FLOW   | поступил контейнер весом 17.0 т                         | склад[шт]=  11 вес=   226.2 т | N0:РЕЙС N1:РЕЙС H2:ГОТОВ
 
 === ИТОГОВЫЙ БАЛАНС ПРОГОНА (трассировка) ===
-прибыло тонн: 527662.0 | вывезено+остаток: 527662.0 | расхождение: 0.000000
+прибыло = вывезено + остаток склада: 527662.0 = 527662.0 | расхождение: 0.000000 т (груз в самолётах: 0.0 т)
 R1_n_departures            = 3265
 R2_share_high              = 0.2536
 R3_avg_store_count         = 27.1949
 R4_avg_wait                = 8.9041
-R5_avg_loading_ops         = 0.4510
-R6_delivered_tons          = 527435.8209
-R7_stored_tons_end         = 226.1807
-R8_in_planes_tons          = 0
 arrived_tons               = 527662.0016
+delivered_tons             = 527435.8209
+stored_tons_end            = 226.1807
+in_planes_tons             = 0
 n_departures_high          = 828
 n_containers_loaded        = 26400

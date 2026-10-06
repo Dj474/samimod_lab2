@@ -8,6 +8,7 @@
 События:
   ARRIVAL    - поступление контейнера
   LOAD_STEP  - загрузка одного контейнера на самолёт
+  DEPARTURE  - отправка самолёта после полной загрузки
   RETURN     - возврат самолёта из рейса (готов к загрузке)
   END        - конец прогона
 
@@ -215,6 +216,8 @@ class Simulation:
                 self._on_arrival()
             elif kind == "LOAD_STEP":
                 self._on_load_step(arg)
+            elif kind == "DEPARTURE":
+                self._on_departure(arg)
             elif kind == "RETURN":
                 self._on_return(arg)
         self._finalize()
@@ -259,12 +262,12 @@ class Simulation:
                 f"загружен контейнер {w:.1f} т, уже {p.loaded:.0f}/{p.capacity} т",
             )
         if p.loaded >= p.capacity:
-            self._departure(p)
+            self._schedule(0.0, "DEPARTURE", p)
         else:
             self._advance_loading()
             self._try_dispatch(reason="load")
 
-    def _departure(self, p):
+    def _on_departure(self, p):
         w = p.loaded
         self.n_departures += 1
         if p.type == HIGH:

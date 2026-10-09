@@ -1,11 +1,14 @@
-"""Генерация диаграмм результатов имитации (matplotlib -> PNG).
+"""Диаграммы результатов имитации (matplotlib -> PNG в out/).
 
-Читает out/results_replications.csv, дополнительно запускает один
-представительный прогон (для временного ряда и Gantt-диаграммы) и строит
-восемь диаграмм в папке out/.
+  fig1-fig8  - базовый сценарий (config.json): распределения откликов,
+               ящики, сходимость, доверительные интервалы, Gantt самолётов;
+  fig9       - динамика откликов в модельном времени, базовый сценарий;
+  fig10      - то же для режима перегрузки (config_overload.json).
+
+Графики чувствительности строит sensitivity.py.
 """
 
-import csv
+import bisect
 import math
 import os
 import statistics
@@ -15,13 +18,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from simulation import Simulation, load_config
+from airport import AirportModel, ST_FLYING, ST_LOADING, ST_NAME, ST_READY
+from engine import Runner
+from simulation import Tee, load_config, run_replications
 
 OUT = "out"
 DPI = 130
-ST_READY, ST_LOADING, ST_FLYING = 0, 1, 2
-ST_NAME = {ST_READY: "ГОТОВ", ST_LOADING: "ЗАГРУЗКА", ST_FLYING: "РЕЙС"}
 COL_ST = {ST_READY: "#2ca02c", ST_LOADING: "#ff7f0e", ST_FLYING: "#1f77b4"}
+N_REALIZATIONS = 5
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
@@ -30,42 +34,6 @@ plt.rcParams.update({
     "grid.color": "#d9d9d9",
     "grid.linewidth": 0.6,
 })
-
-
-def pct(vals, p):
-    s = sorted(vals)
-    if not s:
-        return 0.0
-    idx = (len(s) - 1) * p
-    lo = math.floor(idx)
-    hi = math.ceil(idx)
-    if lo == hi:
-        return s[lo]
-    frac = idx - lo
-    return s[lo] * (1 - frac) + s[hi] * frac
-
-
-def t_student(n):
-    if n < 2:
-        return float("inf")
-    table = {
-        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
-        7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131,
-        20: 2.086, 30: 2.042, 40: 2.021, 60: 2.0, 120: 1.98, 1000: 1.96,
-    }
-    df = n - 1
-    if df in table:
-        return table[df]
-    keys = sorted(table)
-    if df < keys[0]:
-        return table[keys[0]]
-    if df > keys[-1]:
-        return 1.96
-    for a, b in zip(keys, keys[1:]):
-        if a <= df <= b:
-            f = (df - a) / (b - a)
-            return table[a] * (1 - f) + table[b] * f
-    return 1.96
 
 
 def savefig(fig, name):
@@ -89,19 +57,19 @@ def plot_hist(values, nbins, fname, title, xlabel, ylabel):
     return savefig(fig, fname)
 
 
-def plot_series(fname, store_w, cum_dep):
+def plot_series(fname, history, title):
     fig, ax1 = plt.subplots(figsize=(11, 5.5))
-    ax1.plot([x / 24 for x, _ in store_w], [y for _, y in store_w],
+    ax1.plot([h[0] / 24 for h in history], [h[2] for h in history],
              color="#1f77b4", lw=1.2, label="Вес груза на складе, т")
     ax1.set_xlabel("Время, сут")
     ax1.set_ylabel("Вес на складе, т", color="#1f77b4")
     ax1.tick_params(axis="y", labelcolor="#1f77b4")
     ax2 = ax1.twinx()
-    ax2.plot([x / 24 for x, _ in cum_dep], [y for _, y in cum_dep],
+    ax2.plot([h[0] / 24 for h in history], [h[3] for h in history],
              color="#d62728", lw=1.6, label="Накопленное число вылетов")
     ax2.set_ylabel("Накопленное число вылетов", color="#d62728")
     ax2.tick_params(axis="y", labelcolor="#d62728")
-    ax1.set_title("Динамика накопителя и вылетов (прогон seed=7)", fontsize=15)
+    ax1.set_title(title, fontsize=15)
     ln1, lb1 = ax1.get_legend_handles_labels()
     ln2, lb2 = ax2.get_legend_handles_labels()
     ax1.legend(ln1 + ln2, lb1 + lb2, loc="upper left")
@@ -110,12 +78,11 @@ def plot_series(fname, store_w, cum_dep):
 
 
 def plot_boxpanels(fname, panels, title):
-    n = len(panels)
-    cols = 3
-    rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 2.8 * rows))
+    cols = 2
+    rows = math.ceil(len(panels) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 3.2 * rows))
     axes = list(axes.reshape(-1))
-    for ax, (key, vals, label) in zip(axes, panels):
+    for ax, (vals, label) in zip(axes, panels):
         bp = ax.boxplot(vals, orientation="vertical", widths=0.5,
                         patch_artist=True, showmeans=True)
         bp["boxes"][0].set_facecolor("#4C72B0")
@@ -133,18 +100,18 @@ def plot_boxpanels(fname, panels, title):
     return savefig(fig, fname)
 
 
-def plot_convergence(fname, series, title, labels):
+def plot_convergence(fname, series, title):
     fig, ax = plt.subplots(figsize=(10, 5.5))
-    n = max(len(v) for v, _ in series)
-    for (vals, col), lab in zip(series, labels):
-        acc = 0.0
-        run = []
+    for vals, col, lab in series:
+        acc, run = 0.0, []
         for i, v in enumerate(vals, 1):
             acc += v
             run.append(acc / i)
-        ax.plot(range(1, n + 1), run, color=col, lw=2, label=lab)
+        ax.plot(range(1, len(vals) + 1), [v / run[-1] for v in run],
+                color=col, lw=2, label=lab)
+    ax.axhline(1.0, color="#555", lw=1, ls="--")
     ax.set_xlabel("Число прогонов")
-    ax.set_ylabel("Скользящее среднее отклика")
+    ax.set_ylabel("Скользящее среднее / итоговое среднее")
     ax.set_title(title, fontsize=15)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -152,18 +119,16 @@ def plot_convergence(fname, series, title, labels):
 
 
 def plot_ci_bars(fname, panels, title):
-    n = len(panels)
-    cols = 3
-    rows = math.ceil(n / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 2.8 * rows))
+    cols = 2
+    rows = math.ceil(len(panels) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 3.2 * rows))
     axes = list(axes.reshape(-1))
-    for ax, (lab, m, ci, dig) in zip(axes, panels):
-        ax.bar([0], [m], yerr=[ci], width=0.55, color="#4C72B0",
+    for ax, (lab, st, dig) in zip(axes, panels):
+        ax.bar([0], [st["mean"]], yerr=[st["ci"]], width=0.55, color="#4C72B0",
                capsize=6, alpha=0.85, error_kw={"ecolor": "#d62728", "lw": 2})
         ax.set_title(lab, fontsize=12)
         ax.set_xticks([])
-        ax.yaxis.set_major_locator(plt.MaxNLocator(5))
-        ax.text(0, m, f"{m:.{dig}f} ±{ci:.{dig}f}",
+        ax.text(0, st["mean"], f"{st['mean']:.{dig}f} ±{st['ci']:.{dig}f}",
                 ha="center", va="bottom", color="#222", fontsize=10)
     for ax in axes[len(panels):]:
         ax.axis("off")
@@ -175,19 +140,16 @@ def plot_ci_bars(fname, panels, title):
 def plot_gantt(fname, plane_series, n_normal, n_high, title, tmax):
     by_plane = {}
     for t, pid, st in plane_series:
-        if t > tmax:
-            continue
-        by_plane.setdefault(pid, []).append((t, st))
+        if t <= tmax:
+            by_plane.setdefault(pid, []).append((t, st))
     n_planes = n_normal + n_high
     fig, ax = plt.subplots(figsize=(11, 3.2))
     for pid in range(n_planes):
         seq = sorted(by_plane.get(pid, [(0.0, ST_READY)]))
-        for (t0, st0), (t1, st1) in zip(seq, seq[1:]):
-            ax.barh(pid, t1 - t0, left=t0, height=0.7, color=COL_ST[st0],
-                    edgecolor="none")
+        for (t0, st0), (t1, _) in zip(seq, seq[1:]):
+            ax.barh(pid, t1 - t0, left=t0, height=0.7, color=COL_ST[st0], edgecolor="none")
         t0, st0 = seq[-1]
-        ax.barh(pid, tmax - t0, left=t0, height=0.7, color=COL_ST[st0],
-                edgecolor="none")
+        ax.barh(pid, tmax - t0, left=t0, height=0.7, color=COL_ST[st0], edgecolor="none")
     names = [f"Обычный {i + 1}" for i in range(n_normal)]
     names += [f"Повыш. {i - n_normal + 1}" for i in range(n_normal, n_planes)]
     ax.set_yticks(range(n_planes))
@@ -204,16 +166,120 @@ def plot_gantt(fname, plane_series, n_normal, n_high, title, tmax):
     return savefig(fig, fname)
 
 
-def read_results():
-    path = os.path.join(OUT, "results_replications.csv")
-    with open(path, "r", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+def sample(history, grid):
+    """Значения ступенчатых траекторий истории в точках сетки (только для
+    рисования; продвижение времени в модели — по событиям)."""
+    times = [h[0] for h in history]
+    q, r3, r4 = [], [], []
+    for g in grid:
+        i = bisect.bisect_right(times, g) - 1
+        if i < 0:
+            q.append(0.0)
+            r3.append(0.0)
+            r4.append(0.0)
+            continue
+        t, n_store, _, _, area, wait_sum, n_loaded = history[i]
+        q.append(n_store)
+        r3.append((area + n_store * (g - t)) / g if g > 0 else 0.0)
+        r4.append(wait_sum / n_loaded if n_loaded else 0.0)
+    return q, r3, r4
+
+
+def plot_dynamics(fname, runs, horizon, title):
+    t_end = max(run.time for run in runs)
+    grid = [t_end * i / 1500 for i in range(1, 1501)]
+    curves = [sample(run.model.history, grid) for run in runs]
+    days = [g / 24 for g in grid]
+    panels = [
+        (0, "Q(t): контейнеров на складе", "контейнеров"),
+        (1, "R3(t) = ∫Q dt / t: накопленное среднее", "контейнеров"),
+        (2, "R4(t): накопленное среднее ожидание", "часов"),
+    ]
+    fig, axes = plt.subplots(3, 1, figsize=(11, 11), sharex=True)
+    for ax, (k, label, unit) in zip(axes, panels):
+        for i, c in enumerate(curves):
+            ax.plot(days, c[k], lw=0.8, alpha=0.55,
+                    label=f"реализация seed={runs[i].seed}")
+        mean = [statistics.mean(c[k][j] for c in curves) for j in range(len(grid))]
+        ax.plot(days, mean, color="black", lw=2.2,
+                label=f"среднее по {len(runs)} реализациям")
+        ax.axvline(horizon / 24, color="#d62728", ls="--", lw=1.4,
+                   label="конец поступлений (T)")
+        ax.set_title(label, fontsize=13)
+        ax.set_ylabel(unit)
+    axes[0].legend(loc="upper left", fontsize=9)
+    axes[-1].set_xlabel("Модельное время, сут")
+    fig.suptitle(title, fontsize=15, y=1.0)
+    fig.tight_layout()
+    return savefig(fig, fname)
+
+
+def recorded_runs(cfg, n):
+    runner = Runner(lambda c: AirportModel(c, record=True), cfg, n)
+    return runner.run_all()
+
+
+def _run():
+    cfg = load_config("config.json")
+    cfg_over = load_config("config_overload.json")
+
+    runner = run_replications(cfg, "", cfg["n_runs"])
+    R = {k: runner.values(k) for k in
+         ["R1_n_departures", "R2_share_high", "R3_avg_store_count", "R4_avg_wait"]}
+    stats = runner.summary(list(R))
+
+    trace_seed = int(cfg["seed_trace"])
+    rep = Runner(lambda c: AirportModel(c, record=True), cfg, 1).make_run(trace_seed).simulate()
+
+    print("Рисунки:")
+    plot_hist(R["R1_n_departures"], 12, "fig1_hist_R1.png",
+              "Распределение числа вылетевших рейсов по повторным прогонам (R1)",
+              "Число рейсов за прогон", "Частота")
+    plot_hist(R["R2_share_high"], 14, "fig2_hist_R2.png",
+              "Распределение доли рейсов повышенной грузоподъёмности (R2)",
+              "Доля рейсов повышенной грузоподъёмности", "Частота")
+    plot_series("fig3_series.png", rep.model.history,
+                f"Динамика накопителя и вылетов (прогон seed={trace_seed})")
+    plot_hist(R["R4_avg_wait"], 14, "fig4_hist_R4.png",
+              "Распределение среднего времени ожидания контейнера (R4)",
+              "Среднее время ожидания, ч", "Частота")
+    plot_boxpanels("fig5_boxplots.png",
+                   [(R["R1_n_departures"], "R1: число рейсов (адд.)"),
+                    (R["R2_share_high"], "R2: доля рейсов повыш. ГП (адд.)"),
+                    (R["R3_avg_store_count"], "R3: ср. контейнеров на складе (непр.)"),
+                    (R["R4_avg_wait"], "R4: ср. ожидание контейнера, ч (дискр.)")],
+                   "Разброс откликов по повторным прогонам (ящик с усами)")
+    plot_convergence("fig6_conv.png",
+                     [(R["R1_n_departures"], "#1f77b4", "R1 (число рейсов)"),
+                      (R["R2_share_high"], "#9467bd", "R2 (доля повыш. ГП)"),
+                      (R["R3_avg_store_count"], "#d62728", "R3 (контейнеров на складе)"),
+                      (R["R4_avg_wait"], "#2ca02c", "R4 (время ожидания)")],
+                     "Сходимость оценок откликов при увеличении числа прогонов")
+    plot_ci_bars("fig7_CI.png",
+                 [("R1: число рейсов (адд.)", stats["R1_n_departures"], 1),
+                  ("R2: доля повыш. ГП (адд.)", stats["R2_share_high"], 4),
+                  ("R3: контейнеров на складе (непр.)", stats["R3_avg_store_count"], 2),
+                  ("R4: время ожидания, ч (дискр.)", stats["R4_avg_wait"], 3)],
+                 "Оценки откликов: среднее по прогонам и 95%-е доверительные интервалы")
+    plot_gantt("fig8_gantt.png", rep.model.plane_series, cfg["n_normal"], cfg["n_high"],
+               f"Квазипараллельные процессы: состояния самолётов "
+               f"(первый месяц, прогон seed={trace_seed})",
+               min(cfg["horizon"], 720))
+
+    plot_dynamics("fig9_dynamics_base.png", recorded_runs(cfg, N_REALIZATIONS),
+                  cfg["horizon"],
+                  f"Динамика откликов, базовый режим (λ={cfg['arrival_rate']} конт./ч): "
+                  f"переходный период → стационар")
+    plot_dynamics("fig10_dynamics_overload.png", recorded_runs(cfg_over, N_REALIZATIONS),
+                  cfg_over["horizon"],
+                  f"Динамика откликов, перегрузка (λ={cfg_over['arrival_rate']} конт./ч): "
+                  f"стационара нет, рост до T, затем дообслуживание")
+    print("Готово.")
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
     log_path = os.path.join(OUT, "charts_log.txt")
-    from simulation import Tee
     with open(log_path, "w", encoding="utf-8-sig", newline="\n") as fh:
         old = sys.stdout
         sys.stdout = Tee(sys.stdout, fh)
@@ -222,65 +288,6 @@ def main():
         finally:
             sys.stdout = old
     print(f"Лог сохранён: {log_path} (UTF-8)")
-
-
-def _run():
-    cfg = load_config()
-    from simulation import main as sim_main
-    sim_main()
-
-    rows = read_results()
-    n = len(rows)
-
-    R1 = [float(r["R1_n_departures"]) for r in rows]
-    R2 = [float(r["R2_share_high"]) for r in rows]
-    R3 = [float(r["R3_avg_store_count"]) for r in rows]
-    R4 = [float(r["R4_avg_wait"]) for r in rows]
-
-    rep = Simulation(cfg, seed=int(cfg.get("seed_trace", 7)), record=True)
-    rep.run()
-
-    print("Рисунки:")
-    plot_hist(R1, 12, "fig1_hist_R1.png",
-              "Распределение числа вылетевших рейсов по повторным прогонам (R1)",
-              "Число рейсов за горизонт", "Частота")
-    plot_hist(R2, 14, "fig2_hist_R2.png",
-              "Распределение доли рейсов повышенной грузоподъёмности (R2)",
-              "Доля рейсов повышенной грузоподъёмности", "Частота")
-    plot_series("fig3_series.png",
-                [(t, w) for t, c, w, d in rep.history],
-                [(t, d) for t, c, w, d in rep.history])
-    plot_hist(R4, 14, "fig4_hist_R4.png",
-              "Распределение среднего времени ожидания контейнера (R4)",
-              "Среднее время ожидания, ч", "Частота")
-    plot_boxpanels("fig5_boxplots.png",
-                   [("R1", R1, "R1: число рейсов (адд.)"),
-                    ("R2", R2, "R2: доля рейсов повыш. ГП (адд.)"),
-                    ("R3", R3, "R3: ср. число контейнеров на складе (непр.)"),
-                    ("R4", R4, "R4: ср. время ожидания контейнера, ч (дискр.)")],
-                   "Разброс откликов по повторным прогонам (ящик с усами)")
-    plot_convergence("fig6_conv.png",
-                     [(R1, "#1f77b4"), (R3, "#d62728"), (R4, "#2ca02c")],
-                     "Сходимость оценок откликов при увеличении числа прогонов",
-                     ["R1 (число рейсов)", "R3 (контейнеров на складе)",
-                      "R4 (время ожидания, ч)"])
-    panels = []
-    for lab, vals, dig, scale in [
-        ("R1: число рейсов (адд.)", R1, 1, 1),
-        ("R2: доля повыш. ГП (адд.)", R2, 4, 1),
-        ("R3: контейнеров на складе (непр.)", R3, 2, 1),
-        ("R4: время ожидания, ч (дискр.)", R4, 3, 1),
-    ]:
-        m = statistics.mean(vals) * scale
-        s = statistics.stdev(vals) * scale if n > 1 else 0.0
-        panels.append((lab, m, t_student(n) * s / math.sqrt(n), dig))
-    plot_ci_bars("fig7_CI.png", panels,
-                 "Оценки откликов: среднее по прогонам и 95%-е доверительные интервалы")
-    plot_gantt("fig8_gantt.png", rep.plane_series, cfg["n_normal"], cfg["n_high"],
-               "Квазипараллельные процессы: состояния самолётов "
-               "(первый месяц, прогон seed=7)",
-               min(cfg["horizon"], 720))
-    print("Готово.")
 
 
 if __name__ == "__main__":

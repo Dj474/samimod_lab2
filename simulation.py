@@ -1,32 +1,28 @@
-"""Имитационная модель грузового аэропорта (вариант №15).
+"""Запуск имитационной модели грузового аэропорта (вариант №15).
 
-Дискретно-событийное моделирование с продвижением времени по ближайшему
-событию (next-event). Постоянный временной шаг не используется.
+  python simulation.py                              # серия прогонов, отклики в терминал
+  python simulation.py --config config_overload.json # режим перегрузки
+  python simulation.py --runs 20                     # другое число прогонов
+  python simulation.py --trace                       # один прогон с трассировкой
+  python simulation.py --trace-excerpt               # фрагмент трассы в out/
 
-Все случайные величины генерируются единственным датчиком random.Random.
-
-События:
-  ARRIVAL    - поступление контейнера
-  LOAD_STEP  - загрузка одного контейнера на самолёт
-  DEPARTURE  - отправка самолёта после полной загрузки
-  RETURN     - возврат самолёта из рейса (готов к загрузке)
-  END        - конец прогона
-
-Квазипараллельные процессы: CONTAINER_FLOW, PLANE_i, DISPATCHER.
+Прогоны на SimPy (Run, Runner) - engine.py,
+агенты и ресурсы аэропорта (AirportModel) - airport.py.
 """
 
+import csv
+import io
 import json
 import os
-import random
-import math
 import sys
-import csv
-from collections import deque
-from heapq import heappop, heappush
 
-ST_READY, ST_LOADING, ST_FLYING = 0, 1, 2
-ST_NAME = {ST_READY: "ГОТОВ", ST_LOADING: "ЗАГРУЗКА", ST_FLYING: "РЕЙС"}
-NORMAL, HIGH = "normal", "high"
+from airport import AirportModel, RESPONSE_KEYS, RESPONSE_LABELS
+from engine import Runner
+
+CSV_KEYS = ["seed"] + RESPONSE_KEYS + [
+    "arrived_tons", "delivered_tons", "stored_tons_end", "in_planes_tons",
+    "n_departures_high", "n_containers_loaded", "t_end", "drain_time",
+]
 
 
 class Tee:
@@ -51,284 +47,6 @@ class Tee:
                 pass
 
 
-class Plane:
-    __slots__ = ("id", "type", "capacity", "state", "loaded", "n_containers", "scheduled")
-
-    def __init__(self, pid, ptype, capacity):
-        self.id = pid
-        self.type = ptype
-        self.capacity = capacity
-        self.state = ST_READY
-        self.loaded = 0.0
-        self.n_containers = 0
-        self.scheduled = False
-
-
-class Simulation:
-    """Один прогон имитационной модели."""
-
-    def __init__(self, cfg, seed, trace=False, record=False):
-        self.cfg = cfg
-        self.rng = random.Random(seed)
-        self.trace = trace
-        self.record = record
-
-        self.t = 0.0
-        self.T = cfg["horizon"]
-        self.calendar = []
-        self.seq = 0
-        self.plane_series = []
-
-        self.planes = []
-        for i in range(cfg["n_normal"]):
-            self.planes.append(Plane(i, NORMAL, cfg["normal_capacity"]))
-        for i in range(cfg["n_high"]):
-            self.planes.append(Plane(cfg["n_normal"] + i, HIGH, cfg["high_capacity"]))
-        for p in self.planes:
-            self.plane_series.append((0.0, p.id, ST_READY))
-
-        self.store = deque()
-        self.store_weight = 0.0
-        self.arrived_weight = 0.0
-        self.loaded_weight = 0.0
-
-        self.n_departures = 0
-        self.n_departures_high = 0
-        self.wait_times = []
-        self.pending_loads = 0
-
-        self.area_count = 0.0
-        self.area_weight = 0.0
-        self.t_last_area = 0.0
-
-        self.history = []
-
-        self.rng = random.Random(seed)
-        self._schedule(self._exp(self.cfg["arrival_rate"]), "ARRIVAL", None)
-        self._schedule(self.T, "END", None)
-        self._try_dispatch(reason="start")
-        if self.trace:
-            self._trace_header()
-
-    # ------------------------------------------------------------ случайные
-    def _exp(self, rate):
-        if rate <= 0:
-            return 0.0
-        return -math.log(1.0 - self.rng.random()) / rate
-
-    def _uniform(self, a, b):
-        return a + self.rng.random() * (b - a)
-
-    # ------------------------------------------------------------- события
-    def _schedule(self, delay, kind, arg):
-        heappush(self.calendar, (self.t + delay, self.seq, kind, arg))
-        self.seq += 1
-
-    def _next(self):
-        self.t, _, kind, arg = heappop(self.calendar)
-        return kind, arg
-
-    # --------------------------------------------------------------- учёт
-    def _accum_area(self):
-        dt = self.t - self.t_last_area
-        self.area_count += len(self.store) * dt
-        self.area_weight += self.store_weight * dt
-        self.t_last_area = self.t
-
-    def _trace(self, proc, msg):
-        states = " ".join(
-            f"{'N' if p.type == NORMAL else 'H'}{p.id}:{ST_NAME[p.state]}"
-            for p in self.planes
-        )
-        print(
-            f"t={self.t:9.3f} | {proc:16s} | {msg:55s} | "
-            f"склад[шт]={len(self.store):4d} вес={self.store_weight:8.1f} т | {states}"
-        )
-
-    def _trace_header(self):
-        print("=" * 120)
-        print(
-            "КВАЗИПАРАЛЛЕЛЬНАЯ ТРАССА (t | процесс | действие | склад | состояния самолётов)"
-        )
-        print("=" * 120)
-        self._trace("DISPATCHER", "старт прогона, попытка назначения")
-
-    # ------------------------------------------------------- правила логики
-    def _ready_normal(self):
-        return [p for p in self.planes if p.type == NORMAL and p.state == ST_READY]
-
-    def _ready_high(self):
-        return [p for p in self.planes if p.type == HIGH and p.state == ST_READY]
-
-    def _try_dispatch(self, reason=""):
-        """Правило управляющего: обычные самолёты в приоритете."""
-        norm = self._ready_normal()
-        if norm and self.store_weight >= self.cfg["normal_capacity"]:
-            p = norm[0]
-            p.state = ST_LOADING
-            self.plane_series.append((self.t, p.id, ST_LOADING))
-            if self.trace:
-                self._trace(f"PLANE_{p.id}", f"назначен ({NORMAL}), {p.capacity} т")
-            self._advance_loading()
-            return
-        if not norm:
-            high = self._ready_high()
-            if high and self.store_weight >= self.cfg["high_capacity"]:
-                p = high[0]
-                p.state = ST_LOADING
-                self.plane_series.append((self.t, p.id, ST_LOADING))
-                if self.trace:
-                    self._trace(f"PLANE_{p.id}", f"назначен ({HIGH}), {p.capacity} т")
-                self._advance_loading()
-                return
-
-    def _advance_loading(self):
-        """Продвинуть загрузку самолётов, находящихся в состоянии ЗАГРУЗКА.
-
-        Планируется не более одного события LOAD_STEP на самолёт (флаг
-        p.scheduled) и не более числа контейнеров, имеющихся на складе на
-        момент планирования (self.pending_loads < |склад|), что исключает
-        обращение к пустой очереди и двойное планирование.
-        """
-        cfg = self.cfg
-        for p in self.planes:
-            if p.state == ST_LOADING and not p.scheduled:
-                if p.loaded < p.capacity and self.store and self.pending_loads < len(self.store):
-                    dt = self._exp(1.0 / cfg["load_time_mean"])
-                    self.pending_loads += 1
-                    p.scheduled = True
-                    self._schedule(dt, "LOAD_STEP", p)
-                    if self.trace:
-                        self._trace(
-                            f"PLANE_{p.id}",
-                            f"взят контейнер на загрузку "
-                            f"(загружено {p.loaded:.0f}/{p.capacity} т)",
-                        )
-
-    # ------------------------------------------------------------ обработчик
-    def run(self):
-        while self.calendar:
-            kind, arg = self._next()
-            if kind == "END":
-                self._accum_area()
-                break
-            elif kind == "ARRIVAL":
-                self._on_arrival()
-            elif kind == "LOAD_STEP":
-                self._on_load_step(arg)
-            elif kind == "DEPARTURE":
-                self._on_departure(arg)
-            elif kind == "RETURN":
-                self._on_return(arg)
-        self._finalize()
-        return self
-
-    def _on_arrival(self):
-        cfg = self.cfg
-        w = self._uniform(cfg["weight_min"], cfg["weight_max"])
-        self.store.append((w, self.t))
-        self.store_weight += w
-        self.arrived_weight += w
-        self._accum_area()
-        if self.record:
-            self.history.append(
-                (self.t, len(self.store), self.store_weight, self.n_departures)
-            )
-        if self.trace:
-            self._trace(
-                "CONTAINER_FLOW",
-                f"поступил контейнер весом {w:.1f} т",
-            )
-        self._schedule(self._exp(cfg["arrival_rate"]), "ARRIVAL", None)
-        self._advance_loading()
-        self._try_dispatch(reason="arrival")
-
-    def _on_load_step(self, p):
-        p.scheduled = False
-        self.pending_loads -= 1
-        w, t_arr = self.store.popleft()
-        p.loaded += w
-        p.n_containers += 1
-        self.store_weight -= w
-        self._accum_area()
-        self.wait_times.append(self.t - t_arr)
-        if self.record:
-            self.history.append(
-                (self.t, len(self.store), self.store_weight, self.n_departures)
-            )
-        if self.trace:
-            self._trace(
-                f"PLANE_{p.id}",
-                f"загружен контейнер {w:.1f} т, уже {p.loaded:.0f}/{p.capacity} т",
-            )
-        if p.loaded >= p.capacity:
-            self._schedule(0.0, "DEPARTURE", p)
-        else:
-            self._advance_loading()
-            self._try_dispatch(reason="load")
-
-    def _on_departure(self, p):
-        w = p.loaded
-        self.n_departures += 1
-        if p.type == HIGH:
-            self.n_departures_high += 1
-        self.loaded_weight += w
-        p.loaded = 0.0
-        p.n_containers = 0
-        p.state = ST_FLYING
-        if self.trace:
-            kind = NORMAL if p.type == NORMAL else HIGH
-            self._trace(
-                f"PLANE_{p.id}",
-                f"ВЫЛЕТ (рейс #{self.n_departures}, {kind}, груз {w:.0f} т)",
-            )
-        self.plane_series.append((self.t, p.id, ST_FLYING))
-        self._schedule(self._exp(1.0 / self.cfg["flight_time_mean"]), "RETURN", p)
-        self._try_dispatch(reason="departure")
-
-    def _on_return(self, p):
-        p.state = ST_READY
-        if self.trace:
-            self._trace(f"PLANE_{p.id}", "возврат из рейса, готов к загрузке")
-        self.plane_series.append((self.t, p.id, ST_READY))
-        self._try_dispatch(reason="return")
-
-    # ----------------------------------------------------------- результаты
-    def _finalize(self):
-        for p in self.planes:
-            self.plane_series.append((self.t, p.id, p.state))
-        self.in_planes_tons = sum(p.loaded for p in self.planes
-                                  if p.state == ST_LOADING)
-        self.responses = {
-            "R1_n_departures": self.n_departures,
-            "R2_share_high": (self.n_departures_high / self.n_departures
-                              if self.n_departures else 0.0),
-            "R3_avg_store_count": self.area_count / max(self.t, 1e-12),
-            "R4_avg_wait": (sum(self.wait_times) / len(self.wait_times)
-                            if self.wait_times else 0.0),
-            "arrived_tons": self.arrived_weight,
-            "delivered_tons": self.loaded_weight,
-            "stored_tons_end": self.store_weight,
-            "in_planes_tons": self.in_planes_tons,
-            "n_departures_high": self.n_departures_high,
-            "n_containers_loaded": len(self.wait_times),
-        }
-        if self.record:
-            self.history = [tuple(h) for h in self.history]
-
-    def consistency_balance(self):
-        """Внутренняя проверка: прибыло = вывезено + остаток склада.
-
-        Расхождение равно грузу в самолётах, находящихся в процессе
-        загрузки на момент останова (учитывается отдельно).
-        """
-        r = self.responses
-        lhs = r["arrived_tons"]
-        rhs = r["delivered_tons"] + r["stored_tons_end"]
-        return lhs, rhs, abs(lhs - rhs)
-
-
-# ----------------------------------------------------------------------------
 def default_config():
     return {
         "horizon": 8760.0,
@@ -342,93 +60,132 @@ def default_config():
         "load_time_mean": 0.15,
         "flight_time_mean": 6.0,
         "n_runs": 100,
+        "seed_trace": 7,
+        "drain": True,
     }
 
 
 def load_config(path="config.json"):
+    cfg = default_config()
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        cfg = default_config()
-        cfg.update(data)
-        return cfg
-    return default_config()
+            cfg.update(json.load(f))
+    return cfg
+
+
+def scenario_suffix(config_path):
+    stem = os.path.splitext(os.path.basename(config_path))[0]
+    return "" if stem == "config" else stem.replace("config", "", 1)
+
+
+def model_factory(cfg):
+    return AirportModel(cfg)
+
+
+def arg_value(name, default=None):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+def print_responses(responses):
+    for k, v in responses.items():
+        print(f"  {k:22s} = {v:.4f}" if isinstance(v, float) else f"  {k:22s} = {v}")
+
+
+def print_run_row(run):
+    r = run.responses
+    print(f"{run.seed:5d} | {r['R1_n_departures']:6d} | {r['R2_share_high']:7.4f} | "
+          f"{r['R3_avg_store_count']:9.2f} | {r['R4_avg_wait']:9.3f} | "
+          f"{r['drain_time']:8.1f}")
+
+
+def print_summary(runner):
+    n = len(runner.runs)
+    print("\n" + "=" * 96)
+    print(f"СТАТИСТИКА ОТКЛИКОВ ПО {n} ПРОГОНАМ (95% ДИ = m ± t·s/√N)")
+    print("=" * 96)
+    print(f"{'Отклик':40s} | {'среднее':>11s} | {'СКО':>9s} | {'мин':>10s} | "
+          f"{'макс':>10s} | {'±ДИ':>8s}")
+    print("-" * 96)
+    for key, st in runner.summary(RESPONSE_KEYS).items():
+        print(f"{RESPONSE_LABELS[key]:40s} | {st['mean']:11.4f} | {st['std']:9.4f} | "
+              f"{st['min']:10.4f} | {st['max']:10.4f} | {st['ci']:8.4f}")
+    errs = [run.model.balance()[2] for run in runner.runs]
+    print("-" * 96)
+    print(f"Баланс «прибыло = вывезено + склад + в самолётах»: "
+          f"макс. расхождение {max(errs):.2e} т")
+
+
+def run_trace(cfg, suffix):
+    path = os.path.join("out", f"trace_full{suffix}.txt")
+    runner = Runner(model_factory, cfg, 1)
+    with open(path, "w", encoding="utf-8-sig", newline="\n") as fh:
+        old = sys.stdout
+        sys.stdout = Tee(sys.stdout, fh)
+        try:
+            run = runner.make_run(cfg["seed_trace"], trace=True).simulate()
+            lhs, rhs, err = run.model.balance()
+            print("\n=== ОТКЛИКИ ПРОГОНА (трассировка) ===")
+            print_responses(run.responses)
+            print(f"\nБаланс: прибыло {lhs:.1f} т = вывезено + склад + в самолётах "
+                  f"{rhs:.1f} т | расхождение {err:.2e} т")
+        finally:
+            sys.stdout = old
+    print(f"\nПолная трассировка сохранена: {path} (UTF-8)")
+
+
+def run_trace_excerpt(cfg, suffix, lines_limit=80):
+    cfg = dict(cfg, horizon=300.0)
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        Runner(model_factory, cfg, 1).make_run(cfg["seed_trace"], trace=True).simulate()
+    finally:
+        sys.stdout = old
+    lines = buf.getvalue().splitlines()
+    path = os.path.join("out", f"trace_excerpt{suffix}.txt")
+    with open(path, "w", encoding="utf-8-sig", newline="\n") as f:
+        f.write("\n".join(lines[:lines_limit]) + "\n")
+    print(f"Фрагмент трассы ({min(lines_limit, len(lines))} строк из {len(lines)}) -> {path}")
+
+
+def run_replications(cfg, suffix, n_runs):
+    print(f"Сценарий: λ={cfg['arrival_rate']} конт./ч, T={cfg['horizon']:.0f} ч, "
+          f"обычных {cfg['n_normal']}×{cfg['normal_capacity']:.0f} т, "
+          f"повыш. ГП {cfg['n_high']}×{cfg['high_capacity']:.0f} т, "
+          f"дообслуживание={'да' if cfg['drain'] else 'нет'}, прогонов {n_runs}")
+    print(f"\n{'seed':>5s} | {'R1':>6s} | {'R2':>7s} | {'R3':>9s} | {'R4, ч':>9s} | "
+          f"{'дообсл,ч':>8s}")
+    print("-" * 59)
+    runner = Runner(model_factory, cfg, n_runs)
+    runner.run_all(on_run=print_run_row)
+    print_summary(runner)
+
+    path = os.path.join("out", f"results_replications{suffix}.csv")
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        wr = csv.DictWriter(f, fieldnames=CSV_KEYS, extrasaction="ignore")
+        wr.writeheader()
+        for run in runner.runs:
+            wr.writerow(dict(run.responses, seed=run.seed))
+    print(f"Результаты: {path}")
+    return runner
 
 
 def main():
-    cfg = load_config()
+    config_path = arg_value("--config", "config.json")
+    cfg = load_config(config_path)
+    suffix = scenario_suffix(config_path)
     os.makedirs("out", exist_ok=True)
 
     if "--trace-excerpt" in sys.argv:
-        import io
-        cfg2 = dict(cfg)
-        cfg2["horizon"] = 300.0
-        buf = io.StringIO()
-        old = sys.stdout
-        sys.stdout = buf
-        try:
-            sim = Simulation(cfg2, seed=cfg.get("seed_trace", 7), trace=True)
-            sim.run()
-        finally:
-            sys.stdout = old
-        lines = buf.getvalue().splitlines()
-        path = os.path.join("out", "trace_excerpt.txt")
-        with open(path, "w", encoding="utf-8-sig", newline="\n") as f:
-            f.write("\n".join(lines[:80]) + "\n")
-        print(f"Фрагмент трассы ({min(80, len(lines))} строк из "
-              f"{len(lines)}) -> {path}")
-        return sim
-
+        return run_trace_excerpt(cfg, suffix)
     if "--trace" in sys.argv:
-        path = os.path.join("out", "trace_full.txt")
-        with open(path, "w", encoding="utf-8-sig", newline="\n") as fh:
-            old = sys.stdout
-            sys.stdout = Tee(sys.stdout, fh)
-            try:
-                sim = Simulation(cfg, seed=cfg.get("seed_trace", 7),
-                                 trace=True, record=True)
-                sim.run()
-                print("\n=== ИТОГОВЫЙ БАЛАНС ПРОГОНА (трассировка) ===")
-                lhs, rhs, err = sim.consistency_balance()
-                print(f"прибыло = вывезено + остаток склада: {lhs:.1f} = "
-                      f"{rhs:.1f} | расхождение: {err:.6f} т"
-                      f" (груз в самолётах: "
-                      f"{sim.responses['in_planes_tons']:.1f} т)")
-                for k, v in sim.responses.items():
-                    print(f"{k:26s} = {v:.4f}" if isinstance(v, float)
-                          else f"{k:26s} = {v}")
-            finally:
-                sys.stdout = old
-        print(f"\nПолная трассировка сохранена: {path} (UTF-8)")
-        return sim
-
-    n = cfg.get("n_runs", 1)
-    rows = []
-    for run in range(1, n + 1):
-        sim = Simulation(cfg, seed=run, record=True)
-        sim.run()
-        r = sim.responses
-        r["seed"] = run
-        rows.append(r)
-    keys = [
-        "seed", "R1_n_departures", "R2_share_high", "R3_avg_store_count",
-        "R4_avg_wait", "arrived_tons", "delivered_tons", "stored_tons_end",
-        "in_planes_tons", "n_departures_high", "n_containers_loaded",
-    ]
-    with open(os.path.join("out", "results_replications.csv"), "w",
-              newline="", encoding="utf-8-sig") as f:
-        wr = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
-        wr.writeheader()
-        for r in rows:
-            wr.writerow(r)
-    print(f"Выполнено прогонов: {n}. Результаты: out/results_replications.csv")
-    # краткая сводка
-    means = {k: sum(r[k] for r in rows) / n for k in
-             ["R1_n_departures", "R2_share_high", "R3_avg_store_count",
-              "R4_avg_wait"]}
-    for k, v in means.items():
-        print(f"{k:24s} mean = {v:.4f}")
-    return rows
+        return run_trace(cfg, suffix)
+    return run_replications(cfg, suffix, int(arg_value("--runs", cfg["n_runs"])))
 
 
 if __name__ == "__main__":

@@ -288,6 +288,10 @@ def main():
         finally:
             sys.stdout = old
     print(f"Лог сохранён: {log_path} (UTF-8)")
+    if "--show" in sys.argv or "--no-show" not in sys.argv:
+        print("Открываю окно с вкладками…")
+        from view_charts import ChartViewer
+        ChartViewer(OUT).mainloop()
 
 
 if __name__ == "__main__":

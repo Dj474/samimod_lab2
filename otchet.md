@@ -395,7 +395,9 @@ python -m pip install -r requirements.txt           # simpy, matplotlib
 python simulation.py                                # 100 прогонов, отклики в терминал -> out/results_replications.csv
 python simulation.py --config config_overload.json  # режим перегрузки
 python simulation.py --trace                        # прогон с трассировкой -> out/trace_full.txt
-python charts.py                                    # статистики + диаграммы fig1–fig10
+python charts.py                                    # статистики + диаграммы fig1–fig10 + окно с вкладками
+python charts.py --no-show                          # только сохранить PNG, без окна
 python sensitivity.py                               # чувствительность fig11–fig13
+python view_charts.py                               # открыть все fig1–fig13 во вкладках на экране
 python -m unittest tests -v                         # юнит-тесты
 ```
